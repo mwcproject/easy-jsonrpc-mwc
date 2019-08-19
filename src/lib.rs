@@ -6,9 +6,9 @@ Generates rpc handlers based on a trait definition.
 ## Defining an api
 
 ```rust
-use easy_jsonrpc;
+use easy_jsonrpc_mw;
 
-#[easy_jsonrpc::rpc]
+#[easy_jsonrpc_mw::rpc]
 pub trait Adder {
     fn checked_add(&self, a: isize, b: isize) -> Option<isize>;
     fn wrapping_add(&self, a: isize, b: isize) -> isize;
@@ -26,8 +26,8 @@ The rpc macro generates
 ## Server side usage
 
 ```rust
-# use easy_jsonrpc;
-# #[easy_jsonrpc::rpc]
+# use easy_jsonrpc_mw;
+# #[easy_jsonrpc_mw::rpc]
 # pub trait Adder {
 #     fn checked_add(&self, a: isize, b: isize) -> Option<isize>;
 #     fn wrapping_add(&self, a: isize, b: isize) -> isize;
@@ -36,7 +36,7 @@ The rpc macro generates
 #     }
 #     fn takes_ref(&self, rf: &isize);
 # }
-use easy_jsonrpc::{Handler, MaybeReply};
+use easy_jsonrpc_mw::{Handler, MaybeReply};
 use serde_json::json;
 
 struct AdderImpl;
@@ -67,15 +67,15 @@ assert_eq!(
 ## Client side usage
 
 ```rust
-# use easy_jsonrpc;
-# #[easy_jsonrpc::rpc]
+# use easy_jsonrpc_mw;
+# #[easy_jsonrpc_mw::rpc]
 # pub trait Adder {
 #     fn checked_add(&self, a: isize, b: isize) -> Option<isize>;
 #     fn wrapping_add(&self, a: isize, b: isize) -> isize;
 #     fn is_some(&self, a: Option<usize>) -> bool;
 #     fn takes_ref(&self, rf: &isize);
 # }
-# use easy_jsonrpc::{Handler, MaybeReply};
+# use easy_jsonrpc_mw::{Handler, MaybeReply};
 # use serde_json::json;
 # struct AdderImpl;
 # impl Adder for AdderImpl {
@@ -97,22 +97,22 @@ let json_response = match handler.handle_request(call.as_request()) {
    MaybeReply::Reply(resp) => resp,
    MaybeReply::DontReply => panic!(),
 };
-let mut response = easy_jsonrpc::Response::from_json_response(json_response).unwrap();
+let mut response = easy_jsonrpc_mw::Response::from_json_response(json_response).unwrap();
 assert_eq!(tracker.get_return(&mut response).unwrap(), Some(3));
 ```
 
 ## Bonus bits
 
 ```rust
-# use easy_jsonrpc;
-# #[easy_jsonrpc::rpc]
+# use easy_jsonrpc_mw;
+# #[easy_jsonrpc_mw::rpc]
 # pub trait Adder {
 #     fn checked_add(&self, a: isize, b: isize) -> Option<isize>;
 #     fn wrapping_add(&self, a: isize, b: isize) -> isize;
 #     fn is_some(&self, a: Option<usize>) -> bool;
 #     fn takes_ref(&self, rf: &isize);
 # }
-# use easy_jsonrpc::{Handler, MaybeReply};
+# use easy_jsonrpc_mw::{Handler, MaybeReply};
 # use serde_json::json;
 # struct AdderImpl;
 # impl Adder for AdderImpl {
@@ -162,7 +162,7 @@ let notification = bind.notification().as_request();
 assert_eq!(handler.handle_request(notification), MaybeReply::DontReply);
 
 // Batch calls are possible
-use easy_jsonrpc::Call;
+use easy_jsonrpc_mw::Call;
 let bind0 = adder::checked_add(0, 0).unwrap();
 let (call0, tracker0) = bind0.call();
 let bind1 = adder::checked_add(1, 0).unwrap();
@@ -176,7 +176,7 @@ let json_response = match handler.handle_request(json_request) {
    MaybeReply::Reply(resp) => resp,
    MaybeReply::DontReply => panic!(),
 };
-let mut response = easy_jsonrpc::Response::from_json_response(json_response).unwrap();
+let mut response = easy_jsonrpc_mw::Response::from_json_response(json_response).unwrap();
 assert_eq!(tracker1.get_return(&mut response).unwrap(), Some(1));
 assert_eq!(tracker0.get_return(&mut response).unwrap(), Some(0));
 assert_eq!(tracker2.get_return(&mut response).unwrap(), 2);
@@ -187,7 +187,7 @@ assert_eq!(tracker2.get_return(&mut response).unwrap(), 2);
 
 const SERIALZATION_ERROR: i64 = -32000;
 
-pub use easy_jsonrpc_proc_macro::rpc;
+pub use easy_jsonrpc_proc_macro_mw::rpc;
 
 // used from generated code
 #[doc(hidden)]
@@ -662,14 +662,14 @@ where
 
 #[cfg(test)]
 mod test {
-    mod easy_jsonrpc {
+    mod easy_jsonrpc_mw {
         pub use crate::*;
     }
     use super::{Handler, MaybeReply};
     use jsonrpc_core;
     use serde_json::{json, Value};
 
-    #[easy_jsonrpc::rpc]
+    #[easy_jsonrpc_mw::rpc]
     pub trait Adder {
         fn checked_add(&self, a: isize, b: isize) -> Option<isize>;
         fn wrapping_add(&self, a: isize, b: isize) -> isize;
@@ -1034,7 +1034,7 @@ mod test {
 
     #[test]
     fn adder_client_non_macro() {
-        #[easy_jsonrpc::rpc]
+        #[easy_jsonrpc_mw::rpc]
         trait Adder {
             fn checked_add(&self, a: usize, b: usize) -> Option<usize> {
                 a.checked_add(b)
@@ -1048,14 +1048,14 @@ mod test {
                 arg0: usize,
                 arg1: usize,
             ) -> Result<
-                easy_jsonrpc::BoundMethod<'static, Option<usize>>,
-                easy_jsonrpc::ArgSerializeError,
+                easy_jsonrpc_mw::BoundMethod<'static, Option<usize>>,
+                easy_jsonrpc_mw::ArgSerializeError,
             > {
-                Ok(easy_jsonrpc::BoundMethod::new(
+                Ok(easy_jsonrpc_mw::BoundMethod::new(
                     "checked_add",
                     vec![
-                        serde_json::to_value(arg0).map_err(|_| easy_jsonrpc::ArgSerializeError)?,
-                        serde_json::to_value(arg1).map_err(|_| easy_jsonrpc::ArgSerializeError)?,
+                        serde_json::to_value(arg0).map_err(|_| easy_jsonrpc_mw::ArgSerializeError)?,
+                        serde_json::to_value(arg1).map_err(|_| easy_jsonrpc_mw::ArgSerializeError)?,
                     ],
                 ))
             }
@@ -1070,7 +1070,7 @@ mod test {
             .handle_request(call.as_request())
             .as_option()
             .unwrap();
-        let mut response = easy_jsonrpc::Response::from_json_response(raw_response).unwrap();
+        let mut response = easy_jsonrpc_mw::Response::from_json_response(raw_response).unwrap();
         let result: Option<usize> = tracker.get_return(&mut response).unwrap();
         assert_eq!(result, Some(3));
 
@@ -1087,7 +1087,7 @@ mod test {
 
     #[test]
     fn adder_client_with_macro() {
-        #[easy_jsonrpc::rpc]
+        #[easy_jsonrpc_mw::rpc]
         trait Adder {
             fn checked_add(&self, a: usize, b: usize) -> Option<usize> {
                 a.checked_add(b)
@@ -1103,7 +1103,7 @@ mod test {
             .handle_request(call.as_request())
             .as_option()
             .unwrap();
-        let mut response = easy_jsonrpc::Response::from_json_response(raw_response).unwrap();
+        let mut response = easy_jsonrpc_mw::Response::from_json_response(raw_response).unwrap();
         let result: Option<usize> = tracker.get_return(&mut response).unwrap();
         assert_eq!(result, Some(3));
 
@@ -1124,7 +1124,7 @@ mod test {
             .handle_request(call.as_request())
             .as_option()
             .unwrap();
-        let mut response = easy_jsonrpc::Response::from_json_response(raw_response).unwrap();
+        let mut response = easy_jsonrpc_mw::Response::from_json_response(raw_response).unwrap();
         assert_eq!(tracker.get_return(&mut response).unwrap(), 2);
 
         let call = adder::echo_ref(&2).unwrap();
@@ -1137,7 +1137,7 @@ mod test {
     #[test]
     fn response_double_get() {
         let handler = &AdderImpl as &dyn Adder;
-        use easy_jsonrpc::Call;
+        use easy_jsonrpc_mw::Call;
         let bind0 = adder::checked_add(0, 0).unwrap();
         let (call0, tracker0) = bind0.call();
         let bind1 = adder::checked_add(1, 0).unwrap();
@@ -1146,7 +1146,7 @@ mod test {
         let (call2, tracker2) = bind2.call();
         let json_request = Call::batch_request(&[call0, call1, call2]);
         let json_response = handler.handle_request(json_request).as_option().unwrap();
-        let mut response = easy_jsonrpc::Response::from_json_response(json_response).unwrap();
+        let mut response = easy_jsonrpc_mw::Response::from_json_response(json_response).unwrap();
         assert_eq!(tracker0.get_return(&mut response).unwrap(), Some(0));
         assert_eq!(tracker2.get_return(&mut response).unwrap(), 2);
 
@@ -1154,7 +1154,7 @@ mod test {
         assert_eq!(tracker1.get_return(&mut response), Ok(Some(1)));
         assert_eq!(
             tracker1.get_return(&mut response),
-            Err(easy_jsonrpc::ResponseFail::ResultNotFound)
+            Err(easy_jsonrpc_mw::ResponseFail::ResultNotFound)
         );
     }
 
@@ -1163,7 +1163,7 @@ mod test {
         #[derive(serde::Serialize, serde::Deserialize)]
         pub struct Foo;
 
-        #[easy_jsonrpc::rpc]
+        #[easy_jsonrpc_mw::rpc]
         trait Bar {
             fn frob(&self) -> Foo;
             fn borf(&self, foo: Foo);

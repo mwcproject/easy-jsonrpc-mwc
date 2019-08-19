@@ -1,6 +1,6 @@
 //! Rpc definition used by example
 
-use easy_jsonrpc::rpc;
+use easy_jsonrpc_mw::rpc;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 // Sync + Send is only for needed the http listener example

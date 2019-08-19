@@ -4,9 +4,9 @@
 mod common;
 
 use common::frob_machine; // client helpers generated automatically
-use easy_jsonrpc::ArgSerializeError;
-use easy_jsonrpc::BoundMethod;
-use easy_jsonrpc::Response;
+use easy_jsonrpc_mw::ArgSerializeError;
+use easy_jsonrpc_mw::BoundMethod;
+use easy_jsonrpc_mw::Response;
 use serde::Deserialize;
 use std::convert::TryInto;
 use std::io;

@@ -9,7 +9,7 @@ Generates an rpc handler and client helpers based on a trait definition. [docs](
 ```rust
 use easy_jsonrpc;
 
-#[easy_jsonrpc::rpc]
+#[easy_jsonrpc_mw::rpc]
 pub trait Adder {
     fn checked_add(&self, a: isize, b: isize) -> Option<isize>;
     fn wrapping_add(&self, a: isize, b: isize) -> isize;
@@ -27,7 +27,7 @@ The rpc macro generates
 ## Server side usage
 
 ```rust
-use easy_jsonrpc::{Handler, MaybeReply};
+use easy_jsonrpc_mw::{Handler, MaybeReply};
 use serde_json::json;
 
 struct AdderImpl;
@@ -64,7 +64,7 @@ let json_response = match handler.handle_request(call.as_request()) {
    MaybeReply::Reply(resp) => resp,
    MaybeReply::DontReply => panic!(),
 };
-let mut response = easy_jsonrpc::Response::from_json_response(json_response).unwrap();
+let mut response = easy_jsonrpc_mw::Response::from_json_response(json_response).unwrap();
 assert_eq!(tracker.get_return(&mut response).unwrap(), Some(3));
 ```
 
@@ -115,7 +115,7 @@ assert_eq!(handler.handle_request(notification), MaybeReply::DontReply);
 Batch calls are possible.
 
 ```rust
-use easy_jsonrpc::Call;
+use easy_jsonrpc_mw::Call;
 let bind0 = adder::checked_add(0, 0).unwrap();
 let (call0, tracker0) = bind0.call();
 let bind1 = adder::checked_add(1, 0).unwrap();
@@ -129,7 +129,7 @@ let json_response = match handler.handle_request(json_request) {
    MaybeReply::Reply(resp) => resp,
    MaybeReply::DontReply => panic!(),
 };
-let mut response = easy_jsonrpc::Response::from_json_response(json_response).unwrap();
+let mut response = easy_jsonrpc_mw::Response::from_json_response(json_response).unwrap();
 assert_eq!(tracker1.get_return(&mut response).unwrap(), Some(1));
 assert_eq!(tracker0.get_return(&mut response).unwrap(), Some(0));
 assert_eq!(tracker2.get_return(&mut response).unwrap(), 2);
