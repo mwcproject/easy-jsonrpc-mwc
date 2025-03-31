@@ -2,7 +2,7 @@
 
 mod common;
 use crate::common::create_frob_server;
-use easy_jsonrpc_mw::{Handler, MaybeReply};
+use easy_jsonrpc_mwc::{Handler, MaybeReply};
 use serde_json::{self, json};
 use std::net::{Ipv6Addr, SocketAddrV6};
 use std::sync::Arc;

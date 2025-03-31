@@ -4,7 +4,7 @@
 mod common;
 
 use common::frob_machine; // client helpers generated automatically
-use easy_jsonrpc_mw::{BoundMethod, Response};
+use easy_jsonrpc_mwc::{BoundMethod, Response};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
@@ -48,20 +48,21 @@ fn post(addr: &SocketAddrV6, body: &Value) -> Result<Value, reqwest::Error> {
         .json()
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 enum RpcErr {
     Http(reqwest::Error),
     InvalidResponse,
 }
 
-impl From<easy_jsonrpc_mw::InvalidResponse> for RpcErr {
-    fn from(_other: easy_jsonrpc_mw::InvalidResponse) -> Self {
+impl From<easy_jsonrpc_mwc::InvalidResponse> for RpcErr {
+    fn from(_other: easy_jsonrpc_mwc::InvalidResponse) -> Self {
         RpcErr::InvalidResponse
     }
 }
 
-impl From<easy_jsonrpc_mw::ResponseFail> for RpcErr {
-    fn from(_other: easy_jsonrpc_mw::ResponseFail) -> Self {
+impl From<easy_jsonrpc_mwc::ResponseFail> for RpcErr {
+    fn from(_other: easy_jsonrpc_mwc::ResponseFail) -> Self {
         RpcErr::InvalidResponse
     }
 }
