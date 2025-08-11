@@ -187,7 +187,7 @@ assert_eq!(tracker2.get_return(&mut response).unwrap(), 2);
 
 const SERIALZATION_ERROR: i64 = -32000;
 
-pub use easy_jsonrpc_proc_macro_mw::rpc;
+pub use easy_jsonrpc_proc_macro_mwc::rpc;
 
 // used from generated code
 #[doc(hidden)]
