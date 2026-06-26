@@ -4,13 +4,11 @@
 #![recursion_limit = "256"]
 
 extern crate proc_macro;
-use heck::SnakeCase;
+use heck::ToSnakeCase;
 use proc_macro2::{self, Span, TokenStream};
 use quote::{quote, quote_spanned};
-use syn::{
-    parse_macro_input, punctuated::Punctuated, spanned::Spanned, token::Paren, ArgSelfRef, FnArg,
-    FnDecl, Ident, ItemTrait, MethodSig, Pat, PatIdent, ReturnType, TraitItem, Type, TypeTuple,
-};
+use syn::{parse_macro_input, spanned::Spanned, FnArg, Ident, ItemTrait, Pat, PatIdent, ReturnType, TraitItem, Type, Signature, TypeTuple};
+use syn::punctuated::Punctuated;
 
 /// Generate a Handler implementation and client helpers for trait input.
 ///
@@ -64,9 +62,18 @@ fn raise_if_err(res: Result<TokenStream, Rejections>) -> TokenStream {
 }
 
 // generate a Handler implementation for &dyn Trait
+// NOTE: We intentionally rely on serde_json::to_value via `try_serialize` here.
+// serde_json converts non-finite floats (NaN, ±Inf) into JSON `null` instead of erroring.
+// For this RPC layer, that behavior is acceptable and consistent with JSON limitations.
+// Non-finite values are not expected from well-formed handlers, and treating them as
+// `null` avoids introducing additional validation overhead in the generated code.
+// Also values can be rounded automatically if values doesn't fit the type
+//
+// Note: Error output expected to look like:  {"result": {"Err": ...}}
+// It is different from PRC standard
 fn impl_server(tr: &ItemTrait) -> Result<TokenStream, Rejections> {
     let trait_name = &tr.ident;
-    let methods: Vec<&MethodSig> = trait_methods(&tr)?;
+    let methods: Vec<&Signature> = trait_methods(&tr)?;
 
     let handlers = methods.iter().map(|method| {
         let method_literal = method.ident.to_string();
@@ -98,7 +105,7 @@ fn impl_server(tr: &ItemTrait) -> Result<TokenStream, Rejections> {
 
 fn impl_client(tr: &ItemTrait) -> Result<TokenStream, Rejections> {
     let trait_name = &tr.ident;
-    let methods: Vec<&MethodSig> = trait_methods(&tr)?;
+    let methods: Vec<&Signature> = trait_methods(&tr)?;
     let mod_name = Ident::new(&trait_name.to_string().to_snake_case(), Span::call_site());
     let method_impls = methods
         .iter()
@@ -116,10 +123,13 @@ fn impl_client(tr: &ItemTrait) -> Result<TokenStream, Rejections> {
     })
 }
 
-fn impl_client_method(method: &MethodSig) -> Result<TokenStream, Rejections> {
+// Note, non-finite float values will be serialized into the null value. Caller must expect that.
+// i64/u64 values will be serialized without 53-bit safe-integer validation. Serde serializer works with all 64 bits.
+// Other party that read u64 data must be aware about that and handle that properly
+fn impl_client_method(method: &Signature) -> Result<TokenStream, Rejections> {
     let method_name = &method.ident;
     let method_name_literal = &method_name.to_string();
-    let args = get_args(&method.decl)?;
+    let args = get_args(&method)?;
     let fn_definition_args: &Vec<_> = &args
         .iter()
         .enumerate()
@@ -133,8 +143,10 @@ fn impl_client_method(method: &MethodSig) -> Result<TokenStream, Rejections> {
         .enumerate()
         .map(|(i, (name, _))| {
             let arg_num_name = Ident::new(&format!("arg{}", i), name.span());
+            let arg_name = name.to_string();
             quote! {
-                easy_jsonrpc_mwc::serde_json::to_value(#arg_num_name).map_err(|_| easy_jsonrpc_mwc::ArgSerializeError)?
+                easy_jsonrpc_mwc::serde_json::to_value(#arg_num_name)
+                    .map_err(|err| easy_jsonrpc_mwc::ArgSerializeError::from_serde(#arg_name.to_owned(), err))?
             }
         })
         .collect();
@@ -152,22 +164,20 @@ fn impl_client_method(method: &MethodSig) -> Result<TokenStream, Rejections> {
     })
 }
 
-fn return_type_span(method: &MethodSig) -> Span {
-    let return_type = match &method.decl.output {
+fn return_type_span(method: &Signature) -> Span {
+    let return_type = match &method.output {
         ReturnType::Default => None,
         ReturnType::Type(_, typ) => Some(typ),
     };
     return_type
         .map(|typ| typ.span())
-        .unwrap_or_else(|| method.decl.output.span().clone())
+        .unwrap_or_else(|| method.output.span().clone())
 }
 
-fn return_type(method: &MethodSig) -> Type {
-    match &method.decl.output {
+fn return_type(method: &Signature) -> Type {
+    match &method.output {
         ReturnType::Default => Type::Tuple(TypeTuple {
-            paren_token: Paren {
-                span: method.decl.output.span(),
-            },
+            paren_token: Default::default(),
             elems: Punctuated::new(),
         }),
         ReturnType::Type(_, typ) => *typ.clone(),
@@ -175,9 +185,9 @@ fn return_type(method: &MethodSig) -> Type {
 }
 
 // return all methods in the trait, or reject if trait contains an item that is not a method
-fn trait_methods<'a>(tr: &'a ItemTrait) -> Result<Vec<&'a MethodSig>, Rejections> {
+fn trait_methods<'a>(tr: &'a ItemTrait) -> Result<Vec<&'a Signature>, Rejections> {
     let methods = partition(tr.items.iter().map(|item| match item {
-        TraitItem::Method(method) => Ok(&method.sig),
+        TraitItem::Fn(method) => Ok(&method.sig),
         other => Err(Rejection::create(other.span(), Reason::TraitNotStrictlyMethods).into()),
     }))?;
     partition(methods.iter().map(|method| {
@@ -191,9 +201,12 @@ fn trait_methods<'a>(tr: &'a ItemTrait) -> Result<Vec<&'a MethodSig>, Rejections
 }
 
 // generate code that parses rpc arguments and calls the given method
-fn add_handler(trait_name: &Ident, method: &MethodSig) -> Result<TokenStream, Rejections> {
+// Note, numeric values for float targets use unchecked `as` casts (`num_as_self!` and `num_as_copysign_self!`),
+// which can silently round integers/decimals, underflow small values, or overflow `f64` inputs into `f32::INFINITY`
+// Caller should expect such behavior.
+fn add_handler(trait_name: &Ident, method: &Signature) -> Result<TokenStream, Rejections> {
     let method_name = &method.ident;
-    let args = get_args(&method.decl)?;
+    let args = get_args(&method)?;
     let arg_name_literals = args.iter().map(|(id, _)| id.to_string());
     let parse_args = args.iter().enumerate().map(|(index, (ident, ty))| {
         let argname_literal = format!("\"{}\"", ident);
@@ -206,11 +219,15 @@ fn add_handler(trait_name: &Ident, method: &MethodSig) -> Result<TokenStream, Re
             let next_arg = ordered_args.next().expect(
                 "RPC method Got too few args. This is a bug." // checked in get_rpc_args
             );
+            // Note, Serde's numeric `Deserialize` implementations for float targets use unchecked `as` casts (`num_as_self!` and `num_as_copysign_self!`),
+            // which can silently round integers/decimals, underflow small values, or overflow `f64` inputs into `f32::INFINITY`
+            // Note, we don't return error details because we don't want to reveal error internals to outside client.
             easy_jsonrpc_mwc::serde_json::from_value(next_arg).map_err(|_| {
-                easy_jsonrpc_mwc::InvalidArgs::InvalidArgStructure {
-                    name: #argname_literal,
-                    index: #index,
-                }.into()
+                easy_jsonrpc_mwc::InvalidArgs::invalid_arg_structure(
+                    #argname_literal,
+                    #index,
+                    String::from("parsing error"),
+                ).into()
             })?
         }}
     });
@@ -228,21 +245,23 @@ fn add_handler(trait_name: &Ident, method: &MethodSig) -> Result<TokenStream, Re
 
 // Get the name and type of each argument from method. Skip the first argument, which must be &self.
 // If the first argument is not &self, an error will be returned.
-fn get_args<'a>(method: &'a FnDecl) -> Result<Vec<(&'a Ident, &'a Type)>, Rejections> {
+fn get_args<'a>(method: &'a Signature) -> Result<Vec<(&'a Ident, &'a Type)>, Rejections> {
     let mut inputs = method.inputs.iter();
     match inputs.next() {
-        Some(FnArg::SelfRef(ArgSelfRef {
-            mutability: None, ..
-        })) => Ok(()),
+        Some(FnArg::Receiver(receiver))
+        if receiver.reference.is_some() && receiver.mutability.is_none() =>
+            {
+                Ok(())
+            }
         Some(a) => Err(Rejection::create(a.span(), Reason::FirstArgumentNotSelfRef)),
         None => Err(Rejection::create(
             method.inputs.span(),
             Reason::FirstArgumentNotSelfRef,
         )),
     }?;
+
     partition(inputs.map(as_jsonrpc_arg))
 }
-
 // If all Ok, return Vec of successful values, otherwise return all Rejections.
 fn partition<K, I: Iterator<Item = Result<K, Rejections>>>(iter: I) -> Result<Vec<K>, Rejections> {
     let (min, _) = iter.size_hint();
@@ -269,11 +288,11 @@ fn partition<K, I: Iterator<Item = Result<K, Rejections>>>(iter: I) -> Result<Ve
 // Attempt to extract name and type from arg
 fn as_jsonrpc_arg(arg: &FnArg) -> Result<(&Ident, &Type), Rejections> {
     let arg = match arg {
-        FnArg::Captured(captured) => Ok(captured),
+        FnArg::Typed(captured) => Ok(captured),
         a => Err(Rejection::create(a.span(), Reason::ConcreteTypesRequired)),
     }?;
     let ty = &arg.ty;
-    let pat_ident = match &arg.pat {
+    let pat_ident = match &*arg.pat {
         Pat::Ident(pat_ident) => Ok(pat_ident),
         a => Err(Rejection::create(a.span(), Reason::PatternMatchedArg)),
     }?;
@@ -294,6 +313,7 @@ fn as_jsonrpc_arg(arg: &FnArg) -> Result<(&Ident, &Type), Rejections> {
             by_ref: None,
             mutability: None,
             subpat: None,
+            ..
         } => Ok(ident),
     }?;
     Ok((&ident, &ty))

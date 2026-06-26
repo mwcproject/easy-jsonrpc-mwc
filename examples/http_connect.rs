@@ -5,7 +5,7 @@ mod common;
 
 use common::frob_machine; // client helpers generated automatically
 use easy_jsonrpc_mwc::{BoundMethod, Response};
-use reqwest::Client;
+use reqwest::blocking::Client;
 use serde::Deserialize;
 use serde_json::json;
 use serde_json::Value;
@@ -45,7 +45,7 @@ fn post(addr: &SocketAddrV6, body: &Value) -> Result<Value, reqwest::Error> {
         .json(body)
         .send()?
         .error_for_status()?
-        .json()
+        .json::<Value>()
 }
 
 #[allow(dead_code)]
