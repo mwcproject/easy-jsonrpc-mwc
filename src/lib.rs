@@ -171,7 +171,7 @@ let bind2 = adder::wrapping_add(1, 1).unwrap();
 let (call2, tracker2) = bind2.call();
 let bind3 = adder::wrapping_add(1, 1).unwrap();
 let call3 = bind3.notification();
-let json_request = Call::batch_request(&[call0, call1, call2, call3]);
+let json_request = Call::batch_request(&[call0, call1, call2, call3]).unwrap();
 let json_response = match handler.handle_request(json_request) {
    MaybeReply::Reply(resp) => resp,
    MaybeReply::DontReply => panic!(),
@@ -187,6 +187,11 @@ assert_eq!(tracker2.get_return(&mut response).unwrap(), 2);
 
 const SERIALZATION_ERROR: i64 = -32000;
 
+const MAX_SAFE_JSON_INT: u64 = (1u64 << 53) - 1;
+static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+const BATCH_LEN_LIMIT: usize = 128;
+
 pub use easy_jsonrpc_proc_macro_mwc::rpc;
 
 // used from generated code
@@ -199,10 +204,11 @@ use serde::de::Deserialize;
 #[doc(hidden)]
 pub use serde_json::{self, Value};
 
-use rand;
 use serde::ser::Serialize;
 use serde_json::json;
 use std::{collections::BTreeMap, marker::PhantomData};
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Handles jsonrpc requests.
 pub trait Handler {
@@ -218,8 +224,8 @@ pub trait Handler {
                 return MaybeReply::Reply(serde_json::json!({
                     "jsonrpc": "2.0",
                     "error": {
-                        "code": -32700,
-                        "message": "Parse error"
+                        "code": -32600,
+                        "message": "Invalid Request"
                     },
                     "id": null
                 }));
@@ -274,7 +280,7 @@ fn handle_call<S: ?Sized + Handler>(slef: &S, call: jsonrpc_core::Call) -> Optio
         Option<Version>,
     ) = match call {
         jsonrpc_core::Call::Invalid { id } => {
-            return Some(Output::invalid_request(id, None));
+            return Some(Output::invalid_request(id, Some(Version::V2)));
         }
         jsonrpc_core::Call::MethodCall(MethodCall {
             method,
@@ -288,9 +294,32 @@ fn handle_call<S: ?Sized + Handler>(slef: &S, call: jsonrpc_core::Call) -> Optio
             jsonrpc,
         }) => (method, params, None, jsonrpc),
     };
+
+    if version != Some(Version::V2) {
+        // For notification we don't return any error, silently skipping the notification
+        match maybe_id {
+            None => return None,
+            Some(id) => return Some(Output::Failure(Failure {
+                jsonrpc: Some(Version::V2),
+                error: Error::invalid_request(),
+                id,
+            }))
+        }
+    }
+
     let args = Params::from_rc_params(params);
     let ret = slef.handle(&method, args);
-    let id = maybe_id?;
+    // Notifications intentionally do not yield a response, even if handler execution fails.
+    // This matches JSON-RPC semantics. Callers should not use notifications for operations
+    // where failure visibility is required.
+    // Note, we can't log error during notification as well, this crate doesn't use logs
+    let id = match maybe_id {
+        Some(v) => v,
+        None => return None, // It is a notification response.
+    };
+
+    // Note: Error output expected to look like:  {"result": {"Err": ...}}
+    // It is different from PRC standard
     Some(match ret {
         Ok(ok) => Output::Success(Success {
             jsonrpc: version,
@@ -316,10 +345,28 @@ fn handle_parsed_request<S: ?Sized + Handler>(
             handle_call(slef, call).map(jsonrpc_core::Response::Single)
         }
         jsonrpc_core::Request::Batch(mut calls) => {
+            // Limit calls so attacker will not be able to submit arbitrarily large batch to crash the host
+            if calls.is_empty() || calls.len() > BATCH_LEN_LIMIT {
+                return Some(jsonrpc_core::Response::Single(Output::invalid_request(Id::Null, Some(Version::V2))));
+            }
+
+            let mut seen = HashSet::with_capacity(calls.len());
+            for c in &calls {
+                let id = match c {
+                    jsonrpc_core::Call::MethodCall(method) => method.id.clone(),
+                    jsonrpc_core::Call::Invalid { id} => id.clone(),
+                    jsonrpc_core::Call::Notification(_) => continue,
+                };
+                if !seen.insert(id.clone()) {
+                        return Some(jsonrpc_core::Response::Single(Output::from(Err(Error::invalid_params(format!("Duplicated id {:?}", id))), Id::Null, Some(Version::V2))));
+                }
+            }
+
             let outputs = calls
                 .drain(..)
                 .filter_map(|call| handle_call(slef, call))
                 .collect::<Vec<_>>();
+
             if outputs.is_empty() {
                 None
             } else {
@@ -335,9 +382,25 @@ fn handle_parsed_request<S: ?Sized + Handler>(
 )]
 pub enum InvalidArgs {
     WrongNumberOfArgs { expected: usize, actual: usize },
+    DuplicateArgumentName { name: String },
     ExtraNamedParameter { name: String },
     MissingNamedParameter { name: &'static str },
-    InvalidArgStructure { name: &'static str, index: usize },
+    InvalidArgStructure {
+        name: &'static str,
+        index: usize,
+        source: String,
+    },
+}
+
+impl InvalidArgs {
+    #[doc(hidden)]
+    pub fn invalid_arg_structure(name: &'static str, index: usize, source: String) -> Self {
+        InvalidArgs::InvalidArgStructure {
+            name,
+            index,
+            source,
+        }
+    }
 }
 
 impl Into<Error> for InvalidArgs {
@@ -349,13 +412,20 @@ impl Into<Error> for InvalidArgs {
             )),
             InvalidArgs::ExtraNamedParameter { name } => {
                 Error::invalid_params(format!("ExtraNamedParameter {}", name))
-            }
+            },
+            InvalidArgs::DuplicateArgumentName { name } => {
+                Error::invalid_params(format!("DuplicateArgumentName {}", name))
+            },
             InvalidArgs::MissingNamedParameter { name } => {
                 Error::invalid_params(format!("MissingNamedParameter {}", name))
-            }
-            InvalidArgs::InvalidArgStructure { name, index } => Error::invalid_params(format!(
-                "InvalidArgStructure {} at position {}.",
-                name, index
+            },
+            InvalidArgs::InvalidArgStructure {
+                name,
+                index,
+                source,
+            } => Error::invalid_params(format!(
+                "InvalidArgStructure {} at position {}. {}",
+                name, index, source
             )),
         }
     }
@@ -388,18 +458,16 @@ impl Params {
     ///
     /// Verifies:
     ///    - Number of args in positional parameter list is correct
-    ///    - No missing args in named parameter object
+    ///    - Missing values are explicit null. It is used for backward compatibility (we can safely add new Option params)
     ///    - No extra args in named parameter object
     pub fn get_rpc_args(self, names: &[&'static str]) -> Result<Vec<Value>, InvalidArgs> {
-        debug_assert!(
-            {
-                fn contains_duplicates(list: &[&str]) -> bool {
-                    (1..list.len()).any(|i| list[i..].contains(&list[i - 1]))
-                }
-                !contains_duplicates(names)
-            },
-            "get_rpc_args recieved duplicate argument names"
-        );
+        let mut seen = HashSet::with_capacity(names.len());
+        for &name in names {
+            if !seen.insert(name) {
+                return Err(InvalidArgs::DuplicateArgumentName { name: String::from(name) });
+            }
+        }
+
         let ar: Vec<Value> = match self {
             Params::Positional(ar) => ar,
             Params::Named(mut ma) => {
@@ -456,13 +524,17 @@ where
         }
     }
 
-    /// Create a jsonrpc method call with a random id and a tracker for retrieving the return value.
+    /// Create a jsonrpc method call with a sequential id and a tracker for retrieving the return value.
+    /// Ids after reaching MAX_SAFE_JSON_INT can be reused
     pub fn call(&'a self) -> (Call<'a>, Tracker<T>)
     where
         T: Deserialize<'static>,
     {
         let Self { method, args, .. } = self;
-        let id = rand::random::<u64>();
+        // Limit ID made because JSON normally can handle only 53 bits numbers on most platforms
+        // It is expected that Ids will be reused after. The number is so large that it should never happen
+        // It is expected that id is a predictable counter, it is not a secret.
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed) % (MAX_SAFE_JSON_INT + 1);
         (
             Call {
                 method,
@@ -519,28 +591,42 @@ impl<'a> Call<'a> {
     }
 
     /// Convert list of calls to a json object which can be serialized and sent to a jsonrpc server.
-    pub fn batch_request(calls: &[Self]) -> Value {
-        debug_assert!({
-            fn contains_duplicates(list: &[u64]) -> bool {
-                (1..list.len()).any(|i| list[i..].contains(&list[i - 1]))
+    pub fn batch_request(calls: &[Self]) -> Result<Value, Error> {
+        if calls.len() > BATCH_LEN_LIMIT {
+            return Err(Error::invalid_params( format!("Too many calls in a batch request. Got {} with a limit {}", calls.len() , BATCH_LEN_LIMIT) ))
+        }
+        if calls.len() == 0 {
+            return Err(Error::invalid_params( "Empty batch request.".to_string() ));
+        }
+
+        let mut seen = HashSet::with_capacity(calls.len());
+        for c in calls {
+            if let Some(id) = &c.id {
+                if !seen.insert(id) {
+                    return Err(Error::invalid_params(format!("Requests have duplicated ids: {}", id)));
+                }
             }
-            let ids = calls.iter().filter_map(|call| call.id).collect::<Vec<_>>();
-            !contains_duplicates(ids.as_slice())
-        });
-        Value::Array(calls.iter().map(Call::as_request).collect())
+        }
+
+        Ok(Value::Array(calls.iter().map(Call::as_request).collect()))
     }
 }
 
 /// used from generated code
+/// Note, this function serializes signed and unsigned 64-bit integers as JSON numbers correctly,
+/// but reader must take care about 53-bit safe-integer limitaitons. Since it is a problem of
+/// reader client that can be fixed, we don't limit 64 bit integers
 #[doc(hidden)]
 pub fn try_serialize<T: Serialize>(t: &T) -> Result<Value, Error> {
     // Serde serde_json::to_value does not perform io. It's still not safe to unwrap the result. For
     // example, the implementation of Serialize for Mutex returns an error if the mutex is poisined.
     // Another example, serialize(&std::Path) returns an error when it encounters invalid utf-8.
-    serde_json::to_value(t).map_err(|e| Error {
+    serde_json::to_value(t).map_err(|_| Error {
         code: ErrorCode::ServerError(SERIALZATION_ERROR),
         message: "Serialization error".to_owned(),
-        data: Some(Value::String(format!("{}", e))),
+        // Note, not including errors in the data because remote clients can learn internal
+        // serializer failure details through it
+        data: None, //   Some(Value::String(format!("{}", e))),
     })
 }
 
@@ -558,8 +644,34 @@ pub enum ResponseFail {
 /// Thrown when arguments fail to be serialized. Possible causes include, but are not limited to:
 /// - A poisoned mutex
 /// - A cstring containing invalid utf-8
-#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
-pub struct ArgSerializeError;
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
+pub struct ArgSerializeError {
+    /// Name of the argument that failed to serialize.
+    pub arg_name: String,
+    /// Serialization failure details.
+    pub source: String,
+}
+
+impl ArgSerializeError {
+    /// NOTE: We intentionally convert `serde_json::Error` into a String via `to_string()`.
+    /// The error is used for diagnostics/logging only, no downstream logic depends on
+    ///   structured inspection
+    #[doc(hidden)]
+    pub fn from_serde(arg_name: String, source: serde_json::Error) -> Self {
+        Self {
+            arg_name,
+            source: source.to_string(),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn non_finite_float(arg_name: String) -> Self {
+        Self {
+            arg_name,
+            source: "non-finite floats are not valid JSON numbers".to_owned(),
+        }
+    }
+}
 
 /// Returned by [from_json_response](struct.Response.html#method.from_json_response) on error.
 #[derive(Clone, PartialEq, Debug)]
@@ -569,6 +681,19 @@ pub enum InvalidResponse {
     /// Response contains an id that is not number. The client helpers in easy_jsonrpc never send
     /// non-number ids, so if the server responds with a non-number id, something is wrong.
     ContainsNonNumericId,
+    /// Duplicate Id sin the reponse. Normally should never happens
+    /// because requests shouldn't have duplicated ids. Likely it is internal error
+    DuplicateResponseId(u64),
+    /// Rejection because too many requests was submitted
+    ResponseBatchTooLarge {
+        /// Actual batch size
+        actual: usize,
+        /// Expected size limit
+        limit: usize },
+    /// Empty response error
+    EmptyResponse,
+    /// Invalid JSON RPC version
+    InvalidRpcVersion,
 }
 
 /// Special purpose structure for holding a group of responses. Allows for response lookup by id.
@@ -581,50 +706,61 @@ pub struct Response {
 impl Response {
     /// Deserialize response from a jsonrpc server.
     pub fn from_json_response(raw_jsonrpc_response: Value) -> Result<Self, InvalidResponse> {
+        if let Value::Array(ref calls) = raw_jsonrpc_response {
+            if calls.len() > BATCH_LEN_LIMIT {
+                return Err(InvalidResponse::ResponseBatchTooLarge {
+                    actual: calls.len(),
+                    limit: BATCH_LEN_LIMIT,
+                });
+            }
+            if calls.is_empty() {
+                return Err(InvalidResponse::EmptyResponse);
+            }
+        }
+
         let response: jsonrpc_core::Response = serde_json::from_value(raw_jsonrpc_response)
             .map_err(|_| InvalidResponse::DeserailizeFailure)?;
-        let mut calls: Vec<Output> = match response {
+
+        let calls = match response {
             jsonrpc_core::Response::Single(out) => vec![out],
             jsonrpc_core::Response::Batch(outs) => outs,
         };
-        debug_assert!({
-            fn contains_duplicates(list: &[u64]) -> bool {
-                (1..list.len()).any(|i| list[i..].contains(&list[i - 1]))
-            }
-            let ids = calls
-                .iter()
-                .filter_map(|out| match out {
-                    Output::Success(Success {
-                        id: Id::Num(id), ..
-                    })
-                    | Output::Failure(Failure {
-                        id: Id::Num(id), ..
-                    }) => Some(*id),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            !contains_duplicates(ids.as_slice())
-        });
-        let outputs = calls
-            .drain(..)
-            .map(
-                |out| -> Result<(u64, Result<Value, Error>), InvalidResponse> {
-                    match out {
-                        Output::Success(Success {
-                            result,
-                            id: Id::Num(id),
-                            ..
-                        }) => Ok((id, Ok(result))),
-                        Output::Failure(Failure {
-                            error,
-                            id: Id::Num(id),
-                            ..
-                        }) => Ok((id, Err(error))),
-                        _ => Err(InvalidResponse::ContainsNonNumericId),
+
+        let mut outputs: BTreeMap<u64, Result<Value, Error>> = BTreeMap::new();
+
+        for out in calls {
+            match out {
+                Output::Success(Success {
+                                    result,
+                                    id: Id::Num(id),
+                                    jsonrpc
+                                }) => {
+                    if jsonrpc != Some(Version::V2) {
+                        return Err(InvalidResponse::InvalidRpcVersion);
                     }
-                },
-            )
-            .collect::<Result<BTreeMap<u64, Result<Value, Error>>, InvalidResponse>>()?;
+                    if outputs.contains_key(&id) {
+                        return Err(InvalidResponse::DuplicateResponseId(id));
+                    }
+                    outputs.insert(id, Ok(result));
+                }
+                Output::Failure(Failure {
+                                    error,
+                                    id: Id::Num(id),
+                                    jsonrpc,
+                                }) => {
+                    if jsonrpc != Some(Version::V2) {
+                        return Err(InvalidResponse::InvalidRpcVersion);
+                    }
+                    if outputs.contains_key(&id) {
+                        return Err(InvalidResponse::DuplicateResponseId(id));
+                    }
+                    outputs.insert(id, Err(error));
+                }
+
+                _ => return Err(InvalidResponse::ContainsNonNumericId),
+            }
+        }
+
         Ok(Self { outputs })
     }
 
@@ -1054,8 +1190,18 @@ mod test {
                 Ok(easy_jsonrpc_mwc::BoundMethod::new(
                     "checked_add",
                     vec![
-                        serde_json::to_value(arg0).map_err(|_| easy_jsonrpc_mwc::ArgSerializeError)?,
-                        serde_json::to_value(arg1).map_err(|_| easy_jsonrpc_mwc::ArgSerializeError)?,
+                        serde_json::to_value(arg0).map_err(|err| {
+                            easy_jsonrpc_mwc::ArgSerializeError::from_serde(
+                                "a".to_owned(),
+                                err,
+                            )
+                        })?,
+                        serde_json::to_value(arg1).map_err(|err| {
+                            easy_jsonrpc_mwc::ArgSerializeError::from_serde(
+                                "b".to_owned(),
+                                err,
+                            )
+                        })?,
                     ],
                 ))
             }
@@ -1144,7 +1290,7 @@ mod test {
         let (call1, tracker1) = bind1.call();
         let bind2 = adder::wrapping_add(1, 1).unwrap();
         let (call2, tracker2) = bind2.call();
-        let json_request = Call::batch_request(&[call0, call1, call2]);
+        let json_request = Call::batch_request(&[call0, call1, call2]).unwrap();
         let json_response = handler.handle_request(json_request).as_option().unwrap();
         let mut response = easy_jsonrpc_mwc::Response::from_json_response(json_response).unwrap();
         assert_eq!(tracker0.get_return(&mut response).unwrap(), Some(0));
